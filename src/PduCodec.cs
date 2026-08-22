@@ -37,10 +37,31 @@ namespace SmsPing
             });
         }
 
-        // PDU "ping thầm" (special SMS indication) tới 1 số VN
-        public static string BuildPingPdu(string sdt)
+        // PDU "ping thầm" (special SMS indication) tới 1 số VN.
+        // smscPrefix nhét địa chỉ SMSC vào đầu PDU -> modem không cần có SMSC sẵn.
+        // "00" = dùng SMSC lưu trên SIM (mặc định cũ). AT+CMGS=19 GIỮ NGUYÊN (chỉ đếm phần TPDU).
+        public static string BuildPingPdu(string sdt, string smscPrefix = "00")
         {
-            return "0071000B9148" + SwapDigits(sdt) + "000800050401020000";
+            if (string.IsNullOrEmpty(smscPrefix)) smscPrefix = "00";
+            return smscPrefix + "71000B9148" + SwapDigits(sdt) + "000800050401020000";
+        }
+
+        // Mã hoá SMSC vào đầu PDU: [độ dài octet][91=quốc tế][số đã hoán vị nửa-octet].
+        // "+84900000023" -> "07914809000020F3". Rỗng -> "00".
+        public static string EncodeSmscPrefix(string intlNumber)
+        {
+            if (string.IsNullOrEmpty(intlNumber)) return "00";
+            string d = intlNumber.StartsWith("+") ? intlNumber.Substring(1) : intlNumber;
+            System.Text.StringBuilder only = new System.Text.StringBuilder();
+            foreach (char c in d) if (char.IsDigit(c)) only.Append(c);
+            d = only.ToString();
+            if (d.Length == 0) return "00";
+            string padded = (d.Length % 2 == 0) ? d : d + "F";
+            System.Text.StringBuilder sb = new System.Text.StringBuilder();
+            for (int i = 0; i < padded.Length; i += 2) { sb.Append(padded[i + 1]); sb.Append(padded[i]); }
+            string swapped = sb.ToString();
+            int octets = 1 + swapped.Length / 2;
+            return octets.ToString("X2") + "91" + swapped;
         }
 
         private static string Hx(string s, int i)
