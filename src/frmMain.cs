@@ -144,8 +144,8 @@ namespace SmsPing
                 return;
             }
 
-            // Ưu tiên mạng LTE
-            SerialPort1.Write("AT+CNMP=38\r\n"); Thread.Sleep(300); Application.DoEvents();
+            // Chế độ mạng TỰ ĐỘNG (cho phép 2G/3G) -> ping SMS vẫn chạy, đồng thời USSD dùng được
+            SerialPort1.Write("AT+CNMP=2\r\n"); Thread.Sleep(300); Application.DoEvents();
 
             // ---- Dọn bộ nhớ SMS (tránh "+CMS ERROR: Memory full") ----
             // Xóa sạch mọi vùng nhớ: SIM (SM), modem (ME), report (SR)
@@ -233,10 +233,33 @@ namespace SmsPing
             catch (Exception ex) { MessageBox.Show(ex.Message); }
         }
 
+        private string _rxBuffer = "";
+        private readonly System.Collections.Generic.HashSet<string> _decodedPdus =
+            new System.Collections.Generic.HashSet<string>();
+
         private void ReceivedText(string data)
         {
             txtRaw.AppendText(data);
             if (_flagCheckImei) _myImei = _myImei + data;
+
+            // Tự động giải mã report giao hàng (+CDS) ngay khi về -> hiện online/offline
+            _rxBuffer += data;
+            if (_rxBuffer.Length > 8000) _rxBuffer = _rxBuffer.Substring(_rxBuffer.Length - 8000);
+
+            foreach (Match m in Regex.Matches(_rxBuffer, "\\+CDS:\\s*\\d+\\s*([0-9A-Fa-f]{40,})"))
+            {
+                string pdu = m.Groups[1].Value;
+                if (_decodedPdus.Contains(pdu)) continue;
+                KETQUA k = PduCodec.Decode(pdu);
+                if (!k.ER) continue;
+                _decodedPdus.Add(pdu);
+                txtDecode.AppendText(
+                    "PING SMS có CMGS: " + k.MR +
+                    "\r\nĐến SĐT " + k.sdt_dcping +
+                    "\r\nĐược SMSC nhận lúc: " + k.t_ping +
+                    ", phát lúc: " + k.t_report +
+                    "\r\nCó kết quả: " + k.kq + "\r\n\r\n");
+            }
         }
 
         // ============================ PING ============================
@@ -302,9 +325,24 @@ namespace SmsPing
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            SerialPort1.Write("AT+CMGF=1\r\n"); Thread.Sleep(200);
-            SerialPort1.Write("AT+CUSD=1,\"*101#\"\r\n"); Thread.Sleep(200);
-            SerialPort1.Write("AT+CMGF=0\r\n");
+
+            // USSD cần dịch vụ mạng (CS). Đảm bảo chế độ tự động + đã đăng ký mạng.
+            Query("AT+CNMP=2\r\n", 1000, "OK");
+            Query("AT+CREG=1\r\n", 500, "OK");
+            for (int i = 0; i < 16; i++) // chờ đăng ký tối đa ~8s
+            {
+                string reg = Query("AT+CREG?\r\n", 500, "\\+CREG:");
+                if (Regex.IsMatch(reg, "\\+CREG:\\s*\\d,\\s*[15]")) break;
+            }
+
+            Query("AT+CMGF=1\r\n", 500, "OK");
+            string r = Query("AT+CUSD=1,\"*101#\"\r\n", 10000, "\\+CUSD:");
+            Query("AT+CMGF=0\r\n", 400, "OK");
+
+            if (!Regex.IsMatch(r, "\\+CUSD:"))
+                MessageBox.Show("Chưa lấy được tài khoản (mạng chưa sẵn dịch vụ USSD).\r\n" +
+                    "Đợi vài giây cho SIM đăng ký xong rồi bấm lại. Kết quả (nếu có) hiện ở khung RAW CODE.",
+                    "Kiểm tra TK", MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
 
         private void btn_chkHard_Click(object sender, EventArgs e)
@@ -335,8 +373,11 @@ namespace SmsPing
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            sel = sel.Trim().Replace("\r\n", "").Replace("\r", "").Replace("\n", "");
-            KETQUA kq = PduCodec.Decode(sel);
+            // Tách lấy chuỗi PDU hex dài nhất trong vùng chọn (bỏ "+CDS: 25", xuống dòng, khoảng trắng...)
+            string clean = sel.Replace("\r", "").Replace("\n", "").Replace(" ", "");
+            Match hx = Regex.Match(clean, "[0-9A-Fa-f]{40,}");
+            string pdu = hx.Success ? hx.Value : clean;
+            KETQUA kq = PduCodec.Decode(pdu);
             if (!kq.ER)
             {
                 MessageBox.Show("Chỉ chọn phần kết quả REPORT của lệnh PING để DECODE.", "Thông báo",
