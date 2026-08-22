@@ -13,6 +13,7 @@ namespace SmsPing
     {
         private string _myImei = "";       // buffer nhận dữ liệu từ modem
         private bool _flagCheckImei = false;
+        private string _smscPduPrefix = "00"; // SMSC nhét vào đầu PDU khi PING ("00" = dùng SIM)
 
         // ================== BẢNG SMSC THEO NHÀ MẠNG (MCC = 452) ==================
         // 01 Mobifone | 02 Vinaphone | 04 Viettel | 05 Vietnamobile | 07 Gmobile
@@ -162,44 +163,25 @@ namespace SmsPing
             // Ưu tiên lưu tin đến vào bộ nhớ modem cho các lần sau
             SerialPort1.Write("AT+CPMS=\"ME\",\"ME\",\"ME\"\r\n"); Thread.Sleep(250); Application.DoEvents();
 
-            // ---- Nhận diện nhà mạng của SIM rồi set SMSC ----
-            // 1) IMSI (chuẩn nhất, bám theo SIM)
-            _myImei = "";
-            SerialPort1.Write("AT+CIMI\r\n"); Thread.Sleep(600); Application.DoEvents();
-            string smsc = DetectSmscByNetwork(_myImei);
-
-            // 2) Dự phòng: mạng đang bắt
-            if (string.IsNullOrEmpty(smsc))
-            {
-                _myImei = "";
-                SerialPort1.Write("AT+CPSI?\r\n"); Thread.Sleep(900); Application.DoEvents();
-                smsc = DetectSmscByNetwork(_myImei);
-            }
+            // ---- Nhận diện nhà mạng của SIM theo IMSI, lưu SMSC để nhét vào PDU ----
+            // IMSI đọc được kể cả khi SMSC trên SIM trống -> đây là cách chắc chắn nhất.
+            string smsc = DetectSmscByNetwork(Query("AT+CIMI\r\n", 2500, "\\d{15}"));
+            if (smsc == null) smsc = DetectSmscByNetwork(Query("AT+CPSI?\r\n", 2500, "452")); // dự phòng
+            if (smsc == null) smsc = DetectSmscByNetwork(Query("AT+COPS?\r\n", 2500, "452")); // dự phòng
 
             if (!string.IsNullOrEmpty(smsc))
             {
-                SerialPort1.Write("AT+CSCA=\"" + smsc + "\",145\r\n");
-                Thread.Sleep(400); Application.DoEvents();
-
-                _myImei = "";
-                SerialPort1.Write("AT+CSCA?\r\n"); Thread.Sleep(400); Application.DoEvents();
-                if (string.IsNullOrEmpty(ExtractCurrentSmsc(_myImei)))
-                    MessageBox.Show("Đã gửi set SMSC (" + smsc + ") nhưng modem chưa xác nhận.\r\n" +
-                                    "Cứ thử PING; nếu vẫn lỗi thì rút/cắm lại SIM rồi Connect lại.",
-                                    "SMSC", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                // Nhét SMSC thẳng vào PDU -> PING không bao giờ dính "SMSC address unknown"
+                _smscPduPrefix = PduCodec.EncodeSmscPrefix(smsc);
+                // set thêm CSCA cho chắc (không bắt buộc vì PDU đã tự mang SMSC)
+                Query("AT+CSCA=\"" + smsc + "\",145\r\n", 800, "OK");
             }
             else
             {
-                _myImei = "";
-                SerialPort1.Write("AT+CSCA?\r\n"); Thread.Sleep(300); Application.DoEvents();
-                if (string.IsNullOrEmpty(ExtractCurrentSmsc(_myImei)))
-                    MessageBox.Show("Chưa dò được nhà mạng của SIM. Vào tab AT Command gõ 1 dòng:\r\n\r\n" +
-                                    "Viettel      : AT+CSCA=\"+84980200030\"\r\n" +
-                                    "Vinaphone    : AT+CSCA=\"+8491020005\"\r\n" +
-                                    "Mobifone     : AT+CSCA=\"+84900000023\"\r\n" +
-                                    "Vietnamobile : AT+CSCA=\"+84925252525\"\r\n" +
-                                    "Gmobile      : AT+CSCA=\"+84995252525\"",
-                                    "Set SMSC", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                _smscPduPrefix = "00";
+                MessageBox.Show("Chưa dò được nhà mạng của SIM qua IMSI.\r\n" +
+                                "Kiểm tra SIM đã nhận đúng chưa rồi Connect lại.",
+                                "SMSC", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
             SerialPort1.Write("AT+CNMI=1,0,0,1,0\r\n"); Thread.Sleep(200);
@@ -210,29 +192,30 @@ namespace SmsPing
             SetConnected(true);
         }
 
-        // Đọc SMSC hiện tại từ phản hồi AT+CSCA?
-        private static string ExtractCurrentSmsc(string data)
+        // Gửi 1 lệnh và đọc phản hồi tới khi khớp mustMatch hoặc hết timeout (mustMatch có thể null).
+        private string Query(string cmd, int timeoutMs, string mustMatch)
         {
-            Match m = Regex.Match(data ?? "", "\\+CSCA:\\s*\"([^\"]*)\"");
-            return m.Groups[1].Success ? m.Groups[1].Value : "";
+            _myImei = "";
+            SerialPort1.Write(cmd);
+            int waited = 0;
+            while (waited < timeoutMs)
+            {
+                Thread.Sleep(100);
+                Application.DoEvents();
+                waited += 100;
+                if (mustMatch != null && Regex.IsMatch(_myImei, mustMatch)) break;
+            }
+            return _myImei;
         }
 
-        // Dò SMSC theo nhà mạng: ưu tiên IMSI (AT+CIMI), dự phòng chuỗi mạng (CPSI/COPS)
+        // Dò SMSC theo nhà mạng từ IMSI/CPSI/COPS. Bắt "452" + MNC "0X" ở mọi định dạng:
+        // IMSI "45201...", CPSI "452-01", COPS "\"45201\"".
         private static string DetectSmscByNetwork(string data)
         {
             data = data ?? "";
-            string mnc = null;
-
-            Match mi = Regex.Match(data, "452(\\d\\d)\\d{10}"); // IMSI: 452 + MNC(2) + 10 số
-            if (mi.Success) mnc = mi.Groups[1].Value;
-
-            if (mnc == null)
-            {
-                Match mc = Regex.Match(data, "452\\s*[- ]\\s*0(\\d)"); // "452-01" / "452 01"
-                if (mc.Success) mnc = "0" + mc.Groups[1].Value;
-            }
-
-            if (mnc != null && SmscByNetwork.TryGetValue(mnc, out string smsc)) return smsc;
+            Match m = Regex.Match(data, "452[\\s\\-]*(0[1-9])");
+            if (m.Success && SmscByNetwork.TryGetValue(m.Groups[1].Value, out string smsc))
+                return smsc;
             return null;
         }
 
@@ -277,7 +260,7 @@ namespace SmsPing
                     "Thông báo", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            SendPdu(PduCodec.BuildPingPdu(sdt));
+            SendPdu(PduCodec.BuildPingPdu(sdt, _smscPduPrefix));
         }
 
         private void SendPdu(string pdu)
