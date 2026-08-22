@@ -40,6 +40,28 @@ Mobifone khác vùng: Bắc +84900000011, Trung +84900000017 (sửa dòng "01" t
 Build tại chỗ (Windows có .NET SDK): `dotnet build src/SmsPing.csproj -c Release`
 → `src/bin/Release/net48/SmsPing.exe`.
 
+
+## Kiểm tra tài khoản (USSD *101#)
+
+Chế độ mạng đặt **tự động** (`AT+CNMP=2`) để USSD dùng được (LTE-only thường
+báo `+CME ERROR: no network service`). Nút *Kiểm tra TK* sẽ chờ SIM đăng ký
+mạng rồi mới gửi USSD; kết quả hiện ở khung RAW CODE.
+
+
+## Đọc kết quả online/offline
+
+Khi có báo cáo giao hàng (`+CDS`) trả về, chương trình **tự giải mã và hiện
+kết quả** ở khung dưới, ví dụ:
+
+    PING SMS có CMGS: 200
+    Đến SĐT 0967829131
+    Được SMSC nhận lúc: 17:42:33, ngay 22/08/2026, phát lúc: 17:42:34, ngay 22/08/2026
+    Có kết quả: SDT PING ONLINE.
+
+`SDT PING ONLINE.` = số đó đang bật máy (đã nhận tin). Các mã khác (SDT ban,
+SDT Khong hoi dap, Het han...) tương ứng máy bận/tắt/không tồn tại. Vẫn có nút
+**DECODE vùng chọn** để giải mã thủ công 1 đoạn báo cáo bất kỳ.
+
 ## Ghi chú
 
 - Danh sách IMEI thiết bị hợp lệ ở `AllowedImei` trong `src/frmMain.cs`.
