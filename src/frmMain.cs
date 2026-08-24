@@ -53,6 +53,25 @@ namespace SmsPing
                 ckbCr.Checked = true;
                 btnDisconnect.Enabled = false;
                 SetConnected(false);
+
+                // Dòng thông báo kết quả lớn (tạo bằng code) — chèn ngay trên khung KẾT QUẢ
+                int h = 36;
+                lblLatest = new Label
+                {
+                    Text = "Chưa có kết quả PING",
+                    Font = new Font(this.Font.FontFamily, 15F, FontStyle.Bold),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    BackColor = Color.FromArgb(238, 238, 238),
+                    ForeColor = Color.FromArgb(85, 85, 85),
+                    BorderStyle = BorderStyle.FixedSingle,
+                    Location = new Point(txtDecode.Left, txtDecode.Top),
+                    Size = new Size(txtDecode.Width, h),
+                    Anchor = txtDecode.Anchor
+                };
+                txtDecode.Top = txtDecode.Top + h + 2;
+                txtDecode.Height = txtDecode.Height - h - 2;
+                this.Controls.Add(lblLatest);
+                lblLatest.BringToFront();
             }
             catch (Exception ex)
             {
@@ -234,6 +253,7 @@ namespace SmsPing
         }
 
         private string _rxBuffer = "";
+        private Label lblLatest;
         private readonly System.Collections.Generic.HashSet<string> _decodedPdus =
             new System.Collections.Generic.HashSet<string>();
 
@@ -253,13 +273,22 @@ namespace SmsPing
                 KETQUA k = PduCodec.Decode(pdu);
                 if (!k.ER) continue;
                 _decodedPdus.Add(pdu);
-                txtDecode.AppendText(
-                    "PING SMS có CMGS: " + k.MR +
-                    "\r\nĐến SĐT " + k.sdt_dcping +
-                    "\r\nĐược SMSC nhận lúc: " + k.t_ping +
-                    ", phát lúc: " + k.t_report +
-                    "\r\nCó kết quả: " + k.kq + "\r\n\r\n");
+                ShowResult(k);
             }
+        }
+
+        // Hiển thị 1 kết quả: dòng lớn ONLINE/OFFLINE + đưa mới nhất lên ĐẦU danh sách
+        private void ShowResult(KETQUA k)
+        {
+            bool online = k.kq_sms == "SDT PING ONLINE.";
+            lblLatest.Text = k.sdt_dcping + "   :   " + (online ? "ONLINE" : "OFFLINE");
+            lblLatest.ForeColor = online ? Color.FromArgb(0, 150, 0) : Color.Red;
+
+            string line = k.sdt_dcping + " : " + (online ? "ONLINE" : "OFFLINE") + "  (" + k.kq + ")" +
+                "\r\n   PING " + k.MR + " | nhận " + k.t_ping + " | phát " + k.t_report + "\r\n\r\n";
+            txtDecode.Text = line + txtDecode.Text;
+            txtDecode.SelectionStart = 0;
+            txtDecode.ScrollToCaret();
         }
 
         // ============================ PING ============================
@@ -326,23 +355,67 @@ namespace SmsPing
                 return;
             }
 
-            // USSD cần dịch vụ mạng (CS). Đảm bảo chế độ tự động + đã đăng ký mạng.
-            Query("AT+CNMP=2\r\n", 1000, "OK");
-            Query("AT+CREG=1\r\n", 500, "OK");
-            for (int i = 0; i < 16; i++) // chờ đăng ký tối đa ~8s
+            bool prevFlag = _flagCheckImei;
+            _flagCheckImei = true; // để đọc được phản hồi modem trong lúc kiểm tra TK
+            try
             {
-                string reg = Query("AT+CREG?\r\n", 500, "\\+CREG:");
-                if (Regex.IsMatch(reg, "\\+CREG:\\s*\\d,\\s*[15]")) break;
-            }
+                // Nhận diện nhà mạng của SIM qua IMSI (452 + MNC)
+                string imsi = Query("AT+CIMI\r\n", 2500, "\\d{15}");
+                Match mm = Regex.Match(imsi, "452(0[1-9])");
+                string mnc = mm.Success ? mm.Groups[1].Value : "";
 
-            Query("AT+CMGF=1\r\n", 500, "OK");
-            string r = Query("AT+CUSD=1,\"*101#\"\r\n", 10000, "\\+CUSD:");
-            Query("AT+CMGF=0\r\n", 400, "OK");
+                // Đảm bảo đã đăng ký dịch vụ mạng (CS) cho USSD
+                Query("AT+CREG=1\r\n", 500, "OK");
+                for (int i = 0; i < 12; i++)
+                    if (Regex.IsMatch(Query("AT+CREG?\r\n", 500, "\\+CREG:"), "\\+CREG:\\s*\\d,\\s*[15]")) break;
 
-            if (!Regex.IsMatch(r, "\\+CUSD:"))
-                MessageBox.Show("Chưa lấy được tài khoản (mạng chưa sẵn dịch vụ USSD).\r\n" +
-                    "Đợi vài giây cho SIM đăng ký xong rồi bấm lại. Kết quả (nếu có) hiện ở khung RAW CODE.",
+                // Đầu số tra cước chính theo nhà mạng (hiện dùng chung *101#)
+                string ussd = "*101#"; // 01 Mobifone / 02 Vinaphone / 04 Viettel / 05 Vietnamobile / 07 Gmobile
+
+                // Thử USSD (giải phóng phiên cũ + thử lại khi mạng báo bận/retry)
+                Query("AT+CMGF=1\r\n", 500, "OK");
+                Query("AT+CSCS=\"GSM\"\r\n", 500, "OK");
+                Query("AT+CUSD=2\r\n", 800, null);
+
+                string r = "";
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    r = Query("AT+CUSD=1,\"" + ussd + "\"\r\n", 12000, "\\+CUSD:|ERROR");
+                    if (Regex.IsMatch(r, "\\+CUSD:")) break;
+                    Query("AT+CUSD=2\r\n", 800, null);
+                    Thread.Sleep(2000); Application.DoEvents();
+                }
+
+                if (Regex.IsMatch(r, "\\+CUSD:")) // lấy được tài khoản qua USSD
+                {
+                    Query("AT+CMGF=0\r\n", 400, "OK");
+                    return;
+                }
+
+                // USSD không được -> Viettel đã NGỪNG USSD (từ 13/05/2026): dùng SMS "TK" gửi 191
+                if (mnc == "04")
+                {
+                    Query("AT+CNMI=2,2,0,0,0\r\n", 500, "OK"); // cho tin đến hiện thẳng ra
+                    Query("AT+CSCS=\"GSM\"\r\n", 500, "OK");
+                    SerialPort1.Write("AT+CMGS=\"191\"\r\n"); Thread.Sleep(600); Application.DoEvents();
+                    SerialPort1.Write("TK"); Thread.Sleep(200);
+                    SerialPort1.Write("\u001a"); // gửi
+                    string rr = Query("", 12000, "\\+CMT:");
+                    Query("AT+CNMI=1,0,0,1,0\r\n", 400, "OK"); // khôi phục cấu hình của tool
+                    Query("AT+CMGF=0\r\n", 400, "OK");
+                    if (!Regex.IsMatch(rr, "\\+CMT:"))
+                        MessageBox.Show("Viettel đã ngừng *101# (từ 13/05/2026). Đã gửi 'TK' đến 191,\r\n" +
+                            "chờ vài giây, tin trả lời số dư sẽ hiện ở khung RAW CODE.",
+                            "Kiểm tra TK", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                Query("AT+CMGF=0\r\n", 400, "OK");
+                MessageBox.Show("Chưa lấy được tài khoản sau vài lần thử (mạng báo bận / retry).\r\n" +
+                    "Đợi ~10 giây rồi bấm lại. Kết quả (nếu có) hiện ở khung RAW CODE.",
                     "Kiểm tra TK", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+            finally { _flagCheckImei = prevFlag; }
         }
 
         private void btn_chkHard_Click(object sender, EventArgs e)
@@ -362,6 +435,12 @@ namespace SmsPing
         {
             txtRaw.Clear();
             txtDecode.Clear();
+            if (lblLatest != null)
+            {
+                lblLatest.Text = "Chưa có kết quả PING";
+                lblLatest.ForeColor = Color.FromArgb(85, 85, 85);
+            }
+            _decodedPdus.Clear();
         }
 
         private void btnDecodeSel_Click(object sender, EventArgs e)
@@ -384,12 +463,8 @@ namespace SmsPing
                     MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
-            txtDecode.AppendText(
-                "PING SMS có CMGS: " + kq.MR +
-                "\r\nĐến SĐT " + kq.sdt_dcping +
-                "\r\nĐược SMSC nhận lúc: " + kq.t_ping +
-                ", phát lúc: " + kq.t_report +
-                "\r\nCó kết quả: " + kq.kq + "\r\n\r\n");
+            txtDecode.Focus();
+            ShowResult(kq);
         }
 
         // ============================ MISC ============================
